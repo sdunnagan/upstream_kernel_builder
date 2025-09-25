@@ -5,8 +5,8 @@
 #
 # Description:
 # ------------
-# - Builds an upstream Linux kernel for aarch64 using an out-of-tree build
-#   directory and a known-good Fedora .config (copied in beforehand).
+# - Builds an upstream Linux kernel using an out-of-tree build dir and a
+#   known-good Fedora .config (copied in beforehand).
 #
 # - Optionally tweaks the .config for fast dev (-f) or debug (-d), then runs
 #   olddefconfig to normalize new symbols.
@@ -15,7 +15,7 @@
 #     * Modules: copied via tar-over-SSH to /lib/modules on the target.
 #     * Kernel image: copied to /boot.
 #     * DTB: copied to /boot.
-#     * Initramfs: created on the target with dracut.
+#     * Initramfs: created on the target using dracut.
 #
 # - Adds a GRUB boot entry on the target.
 #
@@ -39,17 +39,17 @@
 #
 # Examples:
 # ---------
-# Build and installing for GRUB on a specified target:
-#   $ upstream_kernel_builder -t orthanc -a aarch64 -f -i grub -b
+# Build and install for GRUB on a specified target and fast initramfs:
+#     $ upstream_kernel_builder -s beethoven -t orthanc -a aarch64 -f -i grub -b
 #
-# Install-only (no rebuild):
-#   $ upstream_kernel_builder -t orthanc -a aarch64 -i grub
+# Install-only (reuse existing build; suffix is ignored without -b):
+#     $ upstream_kernel_builder -t orthanc -a aarch64 -f -i grub
 #
-# Uninstall:
-#   $ upstream_kernel_builder -t orthanc -a aarch64 -u
+# Uninstall (remove the release containing -beethoven on target):
+#     $ upstream_kernel_builder -s beethoven -t orthanc -a aarch64 -u
 #
-# Clean the build:
-#   $ upstream_kernel_builder -c
+# Clean the build (suffix not used here):
+#     $ upstream_kernel_builder -c
 #------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -63,7 +63,8 @@ DO_CLEAN=false
 DO_UNINSTALL=false
 DEBUG_CONFIG=false
 FAST_CONFIG=false
-LOCALVERSION="${LOCALVERSION:--holst}"
+CLI_SUFFIX=""
+LOCALVERSION="${LOCALVERSION:-}"
 LOG_DIR="${LOG_DIR:-$HOME/logs}"
 LOG_FILE=""
 
@@ -86,7 +87,8 @@ REVERSE=$(tput smso)
 UNDERLINE=$(tput smul)
 
 if [[ -z "${KERNEL_SRC_DIR:-}" || -z "${KERNEL_BUILD_DIR:-}" ]]; then
-    echo "${RED}Error: KERNEL_SRC_DIR and KERNEL_BUILD_DIR must be set${NORMAL}" >&2
+    echo "${BOLD}${RED}Error: KERNEL_SRC_DIR and KERNEL_BUILD_DIR must be set"
+    echo "${NORMAL}"
     exit 1
 fi
 
@@ -103,6 +105,7 @@ usage()
     echo "  -f                            Configure kernel for fast dev loop"
     echo "  -i <boot|grub|extlinux|rpm>   Installation mode (focus: grub)"
     echo "  -u                            Uninstall the current build's KREL from target"
+    echo "  -s <suffix|none>              Kernel LOCALVERSION suffix (none = no suffix)"
     echo "  -h                            Help"
     echo ""
     echo "Env:"
@@ -112,7 +115,7 @@ usage()
     exit 1
 }
 
-while getopts "a:t:bcdfhi:u" opt; do
+while getopts "a:t:bcdfhi:us:" opt; do
     case $opt in
         a) BUILD_ARCH="$OPTARG" ;;
         t) TARGET_HOST="$OPTARG" ;;
@@ -122,10 +125,45 @@ while getopts "a:t:bcdfhi:u" opt; do
         f) FAST_CONFIG=true ;;
         i) INSTALL_MODE="$OPTARG" ;;
         u) DO_UNINSTALL=true ;;
+        s) CLI_SUFFIX="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
 done
+
+status_begin() {
+  local msg="$1"
+  printf "%s%s...%s" "${WHITE}" "$msg" "${NORMAL}"
+}
+
+# Clear current line, then print final text + newline.
+status_end_ok() {
+  local msg="$1"
+  printf "\r\033[2K%s%s... %sDone%s\n" "${WHITE}" "$msg" "${BOLD}${GREEN}" "${NORMAL}"
+}
+
+status_end_fail() {
+  local msg="$1" rc="${2:-1}"
+  printf "\r\033[2K%s%s... %sFailed%s (rc=%s)\n" "${WHITE}" "$msg" "${BOLD}${RED}" "${NORMAL}" "$rc"
+}
+
+# Normalize suffix: "beethoven" -> "-beethoven"; "-beethoven" stays; "none"/"" -> ""
+normalize_localversion() {
+    local s="$1"
+    if [[ -z "$s" || "$s" == "none" ]]; then
+        echo ""
+        return
+    fi
+    if [[ "$s" == -* ]]; then
+        echo "$s"
+    else
+        echo "-$s"
+    fi
+}
+
+if [[ -n "$CLI_SUFFIX" ]]; then
+    LOCALVERSION="$(normalize_localversion "$CLI_SUFFIX")"
+fi
 
 create_log_file() {
     local ts gccv host
@@ -156,12 +194,9 @@ generate_ctags()
     echo "${WHITE}Generating ctags..."
     echo "${NORMAL}"
 
-    # Create necessary directories
     mkdir -p ~/tmp
     rm -f "${KERNEL_BUILD_DIR}/tags"
 
-    # Generate tags from source directory but write to build directory.
-    # Use kernel-specific exclusions.
     ctags --tag-relative=yes \
           --sort=yes \
           --recurse \
@@ -190,7 +225,7 @@ generate_ctags()
 
     if [[ $? -ne 0 ]]; then
         echo "${RED}${BOLD}"
-        echo "Error: Failed to generate tags"
+        echo "${BOLD}${RED}Error: Failed to generate tags"
         echo "${NORMAL}"
         exit 1
     fi
@@ -211,14 +246,18 @@ fi
 validate_architecture()
 {
     case "$BUILD_ARCH" in x86_64|aarch64|riscv64) : ;; *)
-        echo "${RED}Unsupported arch: $BUILD_ARCH${NORMAL}" >&2; exit 2;;
+        echo "${BOLD}${RED}Error: Unsupported arch: ${CYAN}${BUILD_ARCH}"
+        echo "${NORMAL}"
+        exit 2
     esac
 }
 
 validate_install_mode()
 {
     case "${1:-}" in ""|boot|grub|extlinux|rpm) : ;; *)
-        echo "${RED}Unsupported install mode: $1${NORMAL}" >&2; exit 2;;
+        echo "${BOLD}${RED}Error: Unsupported install mode: ${CYAN}$1"
+        echo "${NORMAL}"
+        exit 2
     esac
 }
 
@@ -232,17 +271,17 @@ validate_local_commands()
 
 ensure_remote_sudo()
 {
-    # Fail fast if sudo would prompt
     ssh -o BatchMode=yes "$TARGET_HOST" 'sudo -n true' 2>/dev/null || {
-        echo "Remote sudo on $TARGET_HOST needs a password or NOPASSWD. Run: ssh -t $TARGET_HOST 'sudo -v'"
+        echo "${BOLD}${RED}Error: Remote sudo needs a password on ${CYAN}${TARGET_HOST}"
+        echo "${NORMAL}"
         exit 2
     }
 }
 
 validate_remote_commands()
 {
-    # Check required tools on the TARGET as root (so /usr/sbin is in PATH)
-    ssh "$TARGET_HOST" 'set -e
+    # Check required tools on the target as root.
+    ssh "${TARGET_HOST}" 'set -e
         miss=0
         for c in grubby dracut tar tee install chmod mkdir depmod; do
             sudo -n sh -lc "command -v $c >/dev/null 2>&1" || { echo "Missing on target (as root): $c"; miss=1; }
@@ -267,10 +306,6 @@ clean_kernel()
 {
     echo "${WHITE}Cleaning O=$KERNEL_BUILD_DIR ...${NORMAL}"
     make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" mrproper
-
-    echo ""
-    echo "${GREEN}${BOLD}Clean complete"
-    echo "${NORMAL}"
 }
 
 configure_kernel_for_debug()
@@ -312,168 +347,450 @@ configure_kernel_for_fast_dev()
     "$kconf" --file "$cfg" --disable MODULE_SIG_ALL
     "$kconf" --file "$cfg" --disable MODULE_SIG_FORCE
     "$kconf" --file "$cfg" --disable DEBUG_INFO
+
+    # Disable IKHEADERS: this generates /proc/kheaders.tar.xz for eBPF/self-build tooling.
+    # On Fedora/RockPro64 we don’t need it, and leaving it enabled causes
+    # out-of-tree builds with O= to fail because kbuild looks for
+    # $(srctree)/include/generated (which doesn’t exist in an O= setup).
+    "$kconf" --file "$cfg" --disable IKHEADERS
 }
 
 configure_kernel()
 {
-    echo ""
-    echo "${WHITE}Configuring kernel..."
-    echo "${NORMAL}"
+    local rc
 
-    [[ -f "$KERNEL_BUILD_DIR/.config" ]] || { echo "No .config in $KERNEL_BUILD_DIR"; exit 2; }
-    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig
-    [[ "$DEBUG_CONFIG" == true ]] && configure_kernel_for_debug
-    [[ "$FAST_CONFIG" == true  ]] && configure_kernel_for_fast_dev
-    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig
+    echo "${WHITE}Configuring kernel:${NORMAL}"
+
+    # Verify .config exists.
+    status_begin "   - Verifying $KERNEL_BUILD_DIR/.config"
+    if [[ -f "$KERNEL_BUILD_DIR/.config" ]]; then
+        status_end_ok "   - Verifying $KERNEL_BUILD_DIR/.config"
+    else
+        status_end_fail "   - Verifying $KERNEL_BUILD_DIR/.config" "2"
+        echo "${BOLD}${RED}Error: No .config in ${CYAN}${KERNEL_BUILD_DIR}"
+        echo "${NORMAL}"
+        exit 2
+    fi
+
+    # Normalize config.
+    status_begin "   - Normalizing config"
+    if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Normalizing config"
+    else
+        rc=$?; status_end_fail "   - Normalizing config" "$rc"; return "$rc"
+    fi
+
+    # Debugging.
+    if [[ "$DEBUG_CONFIG" == true ]]; then
+        status_begin "   - Applying debug config tweaks"
+        if configure_kernel_for_debug >>"$LOG_FILE" 2>&1; then
+            status_end_ok "   - Applying debug config tweaks"
+        else
+            rc=$?; status_end_fail "   - Applying debug config tweaks" "$rc"; return "$rc"
+        fi
+    fi
+
+    # Fast dev.
+    if [[ "$FAST_CONFIG" == true ]]; then
+        status_begin "   - Applying fast-dev config tweaks"
+        if configure_kernel_for_fast_dev >>"$LOG_FILE" 2>&1; then
+            status_end_ok "   - Applying fast-dev config tweaks"
+        else
+            rc=$?; status_end_fail "   - Applying fast-dev config tweaks" "$rc"; return "$rc"
+        fi
+    fi
+
+    # Normalize again.
+    status_begin "   - Normalizing config again"
+    if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Normalizing config again"
+    else
+        rc=$?; status_end_fail "   - Normalizing config again" "$rc"; return "$rc"
+    fi
 
     echo ""
-    echo "${GREEN}${BOLD}Config complete"
-    echo "${NORMAL}"
 }
 
 get_kernel_release()
 {
-    make -s -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 LOCALVERSION="$LOCALVERSION" kernelrelease
+    make -s -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 kernelrelease
+}
+
+# Persist the chosen LOCALVERSION into the kernel .config and disable
+# the auto '+'.
+set_config_with_localversion()
+{
+    echo "${WHITE}Setting config with local version..."
+    echo "${NORMAL}"
+
+    # Ensure a .config exists.
+    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig >/dev/null
+
+    if [ -x "$KERNEL_SRC_DIR/scripts/config" ]; then
+        "$KERNEL_SRC_DIR"/scripts/config --file "$KERNEL_BUILD_DIR/.config" \
+            --set-str LOCALVERSION "$LOCALVERSION" \
+            --disable LOCALVERSION_AUTO
+    else
+        echo "WARN: $KERNEL_SRC_DIR/scripts/config not found; kernelrelease may vary." >&2
+    fi
+
+    # Refresh and prep headers for out-of-tree modules
+    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 olddefconfig   >/dev/null
+    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules_prepare >/dev/null
 }
 
 build_kernel()
 {
-    echo "${WHITE}Building kernel (Image, modules, and DTBs)...${NORMAL}"
-
-    setup_cross_compile
-
-    create_log_file
-    echo "${NORMAL}" 
-    echo "${WHITE}Log file: ${CYAN}${LOG_FILE}"
-    echo "${NORMAL}"
-
+    local rc
     local start end dur
-    start="$(date +%s)"
 
-    # Build the kernel.
+    echo "${WHITE}Building kernel:${NORMAL}"
+
+    echo "${WHITE}   - Log file: ${CYAN}${LOG_FILE}${NORMAL}"
+
+    # Orin Nano performance mode.
+    if grep -q "Orin Nano" /sys/firmware/devicetree/base/model 2>/dev/null; then
+        status_begin "   - Setting performance mode on Orin Nano"
+        if sudo cpupower frequency-set -g performance >/dev/null 2>&1 || true; then
+            status_end_ok "   - Setting performance mode on Orin Nano"
+        else
+            rc=$?; status_end_fail "   - Setting performance mode on Orin Nano" "$rc"; return "$rc"
+        fi
+    fi
+
+    # Cross-compile env (sets CROSS_COMPILE if host != target arch).
+    status_begin "   - Preparing cross-compile environment"
+    if setup_cross_compile >/dev/null 2>&1; then
+        status_end_ok "   - Preparing cross-compile environment"
+    else
+        rc=$?; status_end_fail "   - Preparing cross-compile environment" "$rc"; return "$rc"
+    fi
+
+    # Apply LOCALVERSION + disable AUTO (writes to .config, modules_prepare).
+    status_begin "   - Applying localversion config"
+    if set_config_with_localversion >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Applying localversion config"
+    else
+        rc=$?; status_end_fail "   - Applying localversion config" "$rc"; return "$rc"
+    fi
+
+    # Build kernel (Image, modules, dtbs).
     local -a MAKE_CMD=(
         make -C "$KERNEL_SRC_DIR" -j"$(nproc)"
-        O="$KERNEL_BUILD_DIR" ARCH=arm64 LOCALVERSION="$LOCALVERSION"
+        O="$KERNEL_BUILD_DIR" ARCH=arm64
         Image modules dtbs
     )
 
-    echo "${WHITE}Build command:"
-    echo "${CYAN}${MAKE_CMD[*]}  (output → ${LOG_FILE})"
-    echo "${NORMAL}"
+    {
+        echo
+        echo "== Build begin"
+        echo "   When:   $(date '+%F %T')"
+        echo -n "   Cmd:    "
+        printf '%q ' "${MAKE_CMD[@]}"
+        echo
+        echo "   Log:    $LOG_FILE"
+    } >>"$LOG_FILE"
 
-    if ! "${MAKE_CMD[@]}" >>"$LOG_FILE" 2>&1; then
-        echo "${RED}Build failed${NORMAL}"
+    status_begin "   - Building kernel (Image, modules, DTBs)"
+    start="$(date +%s)"
+    if "${MAKE_CMD[@]}" >>"$LOG_FILE" 2>&1; then
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build end"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_ok "   - Building kernel (Image, modules, DTBs)"
+    else
+        rc=$?
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build end [FAILED rc=${rc}]"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_fail "   - Building kernel (Image, modules, DTBs)" "$rc"
+        return "$rc"
+    fi
+
+    status_begin "   - Determining kernel release"
+    KERNEL_RELEASE="$(get_kernel_release)"
+    if [[ -n "$KERNEL_RELEASE" ]]; then
+        {
+            echo
+            echo "// KERNEL_RELEASE: ${KERNEL_RELEASE}"
+        } >>"$LOG_FILE"
+        status_end_ok "   - Determining kernel release"
+    else
+        status_end_fail "   - Determining kernel release" "1"
         return 1
     fi
 
-    end="$(date +%s)"; dur=$(( end - start ))
-    KERNEL_RELEASE="$(get_kernel_release)"
-
-    {
-        echo
-        echo "// KERNEL_RELEASE: ${KERNEL_RELEASE}"
-        echo "// Build time: $((dur/60))m $((dur%60))s"
-    } >>"$LOG_FILE"
-
     echo ""
-    echo "${GREEN}${BOLD}Build success"
-    echo "${NORMAL}"
 }
 
-install_boot_payloads()
+# Create and install initramfs on the target.
+create_and_install_initramfs()
 {
-    # Install modules/Image/DTB/initramfs on the target.
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+    local REDIR="${LOG_FILE:-/dev/null}"
+    local rc
 
-    # Modules: stage locally, stream via tar-over-SSH to /lib/modules.
+    status_begin "   - Creating initramfs on target"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo dracut '/boot/initramfs-$KERNEL_RELEASE.img' '$KERNEL_RELEASE' --force" >>"$REDIR" 2>&1; then
+        status_end_ok "   - Creating initramfs on target"
+    else
+        rc=$?; status_end_fail "   - Creating initramfs on target" "$rc"; return "$rc"
+    fi
+}
+
+install_kernel_to_boot_partition()
+{
+    # optional: make SSH snappier on failures
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+
+    # Prepare staging dir
     local STAGE="$KERNEL_BUILD_DIR/stage"
-    rm -rf "$STAGE"
-    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules_install INSTALL_MOD_PATH="$STAGE"
-    tar -C "$STAGE/lib/modules" -cf - "$KERNEL_RELEASE" | ssh "$TARGET_HOST" "sudo tar -C /lib/modules -xpf -"
-    ssh "$TARGET_HOST" "sudo depmod -a $KERNEL_RELEASE"
+    status_begin "   - Cleaning staging dir"
+    if rm -rf "$STAGE" && mkdir -p "$STAGE"; then
+        status_end_ok "   - Cleaning staging dir"
+    else rc=$?; status_end_fail "     - Cleaning staging dir" "$rc"; return "$rc"; fi
 
-    # Kernel Image: stream directly to /boot.
-    ssh "$TARGET_HOST" "sudo tee /boot/Image-$KERNEL_RELEASE >/dev/null" \
-        < "$KERNEL_BUILD_DIR/arch/arm64/boot/Image"
-    ssh "$TARGET_HOST" "sudo chmod 0644 /boot/Image-$KERNEL_RELEASE"
+    # Build modules in the O= tree
+    status_begin "   - Building modules"
+    if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Building modules"
+    else rc=$?; status_end_fail "   - Building modules" "$rc"; return "$rc"; fi
 
-    # RockPro64 DTB: create dir and stream file.
-    ssh "$TARGET_HOST" "sudo install -d /boot/dtb-$KERNEL_RELEASE/rockchip"
-    ssh "$TARGET_HOST" "sudo tee /boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb >/dev/null" \
-        < "$KERNEL_BUILD_DIR/arch/arm64/boot/dts/rockchip/rk3399-rockpro64.dtb"
-    ssh "$TARGET_HOST" "sudo chmod 0644 /boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb"
+    # Install modules into the stage dir
+    status_begin "   - Staging modules"
+    if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 \
+           modules_install INSTALL_MOD_PATH="$STAGE" >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Staging modules"
+    else rc=$?; status_end_fail "   - Staging modules" "$rc"; return "$rc"; fi
 
-    # Initramfs must be created on the target so it matches its userspace.
-    ssh "$TARGET_HOST" "sudo dracut /boot/initramfs-$KERNEL_RELEASE.img $KERNEL_RELEASE --force"
+    # Copy module tree → target:/lib/modules/<rel>
+    status_begin "   - Copying modules"
+    if tar -C "$STAGE/lib/modules" -cf - "$KERNEL_RELEASE" \
+         | ssh $SSH_OPTS "$TARGET_HOST" "sudo tar -C /lib/modules -xpf -"; then
+        status_end_ok "   - Copying modules"
+    else rc=$?; status_end_fail "   - Copying modules" "$rc"; return "$rc"; fi
+
+    # depmod on target
+    status_begin "     - Running depmod on target"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo depmod -a '$KERNEL_RELEASE'"; then
+        status_end_ok "   - Running depmod on target"
+    else rc=$?; status_end_fail "   - Running depmod on target" "$rc"; return "$rc"; fi
+
+    # Copy Image → /boot (use install to set perms and create if missing)
+    status_begin "   - Copying kernel image"
+    if ssh $SSH_OPTS "$TARGET_HOST" \
+         "sudo install -m 0644 /dev/stdin '/boot/Image-$KERNEL_RELEASE' && \
+          (command -v restorecon >/dev/null 2>&1 && sudo restorecon -F '/boot/Image-$KERNEL_RELEASE' || true)" \
+       < "$KERNEL_BUILD_DIR/arch/arm64/boot/Image"; then
+        status_end_ok "   - Copying kernel image"
+    else rc=$?; status_end_fail "   - Copying kernel image" "$rc"; return "$rc"; fi
+
+    # Copy DTB
+    status_begin "   - Copying DTB"
+    if ssh $SSH_OPTS "$TARGET_HOST" \
+         "sudo install -D -m 0644 /dev/stdin \
+            '/boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb' && \
+          (command -v restorecon >/dev/null 2>&1 && sudo restorecon -F '/boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb' || true)" \
+       < "$KERNEL_BUILD_DIR/arch/arm64/boot/dts/rockchip/rk3399-rockpro64.dtb"; then
+        status_end_ok "   - Copying DTB"
+    else rc=$?; status_end_fail "   - Copying DTB" "$rc"; return "$rc"; fi
+
+    # Create initramfs on the target and install it.
+    if ! create_and_install_initramfs; then
+        return $?
+    fi
 }
 
-install_grub()
+install_kernel_for_grub()
 {
-    echo "${WHITE}Installing for GRUB on ${CYAN}$TARGET_HOST${WHITE}..."
-    echo "${NORMAL}"
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
     [[ -n "$KERNEL_RELEASE" ]] || KERNEL_RELEASE="$(get_kernel_release)"
 
-    install_boot_payloads
+    echo "${WHITE}Installing on ${CYAN}${TARGET_HOST}${NORMAL}:"
 
-    # Reuse current cmdline from the target (keeps root=, console=, etc.)
-    local CMDLINE
-    CMDLINE="$(ssh "$TARGET_HOST" 'cat /proc/cmdline')"
-
-    # Add a GRUB/BLS entry for this kernel
-    ssh "$TARGET_HOST" "sudo grubby \
-        --add-kernel=/boot/Image-$KERNEL_RELEASE \
-        --initrd=/boot/initramfs-$KERNEL_RELEASE.img \
-        --title=\"Linux mainline ($KERNEL_RELEASE)\" \
-        --args=\"$CMDLINE\""
-
-    echo "${WHITE}GRUB entry added for $KERNEL_RELEASE on $TARGET_HOST"
-    echo "${NORMAL}"
-
-    echo "${WHITE}Now run on the target:"
-    echo "${CYAN}$ sudo grubby --info=ALL"
-    echo "${CYAN}$ sudo grubby --default-kernel"
-    echo "${CYAN}$ sudo grubby --set-default /boot/Image-6.17.0-rc6-holst"
-    echo "${CYAN}$ sudo reboot"
-    echo "${NORMAL}"
-}
-
-install_extlinux()
-{
-    printf '%s: not implemented yet\n' "${FUNCNAME[0]}"
-    exit 64
-}
-
-install_rpm()
-{
-    printf '%s: not implemented yet\n' "${FUNCNAME[0]}"
-    exit 64
-}
-
-uninstall_kernel()
-{
-    echo "${WHITE}Uninstalling from ${CYAN}$TARGET_HOST${WHITE}..."
-    echo "${NORMAL}"
-    [[ -n "$KERNEL_RELEASE" ]] || KERNEL_RELEASE="$(get_kernel_release)"
-
-    # Safety: don’t remove the running kernel
-    local CURRENT
-    CURRENT="$(ssh "$TARGET_HOST" 'uname -r')"
-    if [[ "$CURRENT" == "$KERNEL_RELEASE" ]]; then
-        echo "${RED}Refusing to uninstall the running kernel ($CURRENT). Reboot into another kernel first.${NORMAL}" >&2
-        exit 65
+    # Boot partition install (modules, Image, DTBs, initramfs).
+    local label rc
+    label="   - Installing to boot partition"
+    status_begin "$label"
+    if install_kernel_to_boot_partition; then
+        status_end_ok "$label"
+    else
+        rc=$?; status_end_fail "$label" "$rc"; return "$rc"
     fi
 
-    # Remove GRUB entry (ignore if absent)
-    ssh "$TARGET_HOST" "sudo grubby --remove-kernel /boot/Image-$KERNEL_RELEASE || true"
+    # Read cmdline from target.
+    label="   - Reading current kernel cmdline from target"
+    status_begin "$label"
+    CMDLINE="$(ssh $SSH_OPTS "$TARGET_HOST" 'cat /proc/cmdline | sed -E "s/ ?BOOT_IMAGE=[^ ]+//"')"
+    status_end_ok "$label"
 
-    # Remove files
-    ssh "$TARGET_HOST" "sudo rm -f /boot/Image-$KERNEL_RELEASE /boot/initramfs-$KERNEL_RELEASE.img || true"
-    ssh "$TARGET_HOST" "sudo rm -rf /boot/dtb-$KERNEL_RELEASE || true"
-    ssh "$TARGET_HOST" "sudo rm -rf /lib/modules/$KERNEL_RELEASE || true"
+    # Create or update GRUB boot entry.
+    label="   - Creating GRUB entry via grubby"
+    status_begin "$label"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo grubby \
+            --add-kernel=/boot/Image-$KERNEL_RELEASE \
+            --initrd=/boot/initramfs-$KERNEL_RELEASE.img \
+            --title=\"Linux mainline ($KERNEL_RELEASE)\" \
+            --args=\"$CMDLINE\"" >>"$LOG_FILE" 2>&1; then
+        status_end_ok "$label"
+    else
+        rc=$?; status_end_fail "$label" "$rc"; return "$rc"
+    fi
 
     echo ""
-    echo "${GREEN}${BOLD}Uninstall complete on ${TARGET_HOST}"
+    echo "${WHITE}Now run on the target:"
+    echo "${CYAN}$ sudo grubby --info=ALL"
+    echo "${CYAN}$ sudo grubby --set-default /boot/Image-<version>"
+    echo "${CYAN}$ sudo grubby --default-kernel"
+    echo "${CYAN}$ sudo reboot"
+    echo "${CYAN}$ uname -r"
     echo "${NORMAL}"
+}
+
+install_kernel_for_extlinux()
+{
+    printf '%s: not implemented yet\n' "${FUNCNAME[0]}"
+    exit 64
+}
+
+install_kernel_with_rpm()
+{
+    printf '%s: not implemented yet\n' "${FUNCNAME[0]}"
+    exit 64
+}
+
+# Resolve which release to uninstall on the TARGET (never the running one).
+# Priority:
+#   - If CLI suffix given: pick the installed release containing that suffix.
+#   - Else: if /boot/Image-$KERNEL_RELEASE exists, use that.
+#   - Else: pick the newest Image-* that is NOT the running kernel.
+resolve_remote_kernel_release_for_uninstall()
+{
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+    local running suffix rel
+
+    running="$(ssh $SSH_OPTS "$TARGET_HOST" 'uname -r' 2>/dev/null || true)"
+
+    # Normalize suffix from CLI, if any.
+    suffix=""
+    if [[ -n "${CLI_SUFFIX:-}" ]]; then
+        suffix="$(normalize_localversion "$CLI_SUFFIX")"
+    elif [[ -n "${LOCALVERSION:-}" ]]; then
+        suffix="$LOCALVERSION"
+    fi
+
+    # Try by suffix via /lib/modules (authoritative inventory).
+    if [[ -n "$suffix" ]]; then
+        rel="$(ssh $SSH_OPTS "$TARGET_HOST" \
+            "ls -1 /lib/modules 2>/dev/null | grep -F -- '$suffix' | head -n1" \
+            || true)"
+        if [[ -n "$rel" ]]; then
+            printf '%s\n' "$rel"
+            return 0
+        fi
+    fi
+
+    # Caller-suggested KERNEL_RELEASE if it exists remotely and isn't running.
+    if [[ -n "${KERNEL_RELEASE:-}" && "$KERNEL_RELEASE" != "$running" ]]; then
+        if ssh $SSH_OPTS "$TARGET_HOST" "test -e '/boot/Image-$KERNEL_RELEASE'"; then
+            printf '%s\n' "$KERNEL_RELEASE"
+            return 0
+        fi
+    fi
+
+    # Fallback: newest Image-* excluding running kernel.
+    rel="$(ssh $SSH_OPTS "$TARGET_HOST" "
+        set -e
+        for p in /boot/Image-*; do
+            [ -e \"\$p\" ] || continue
+            b=\$(basename \"\$p\"); r=\${b#Image-}
+            if [ \"\$r\" != '$running' ]; then
+                printf '%s %s\n' \"\$(stat -c %Y \"\$p\" 2>/dev/null || echo 0)\" \"\$r\"
+            fi
+        done | sort -nr | awk 'NR==1{print \$2}'" || true)"
+    if [[ -n "$rel" ]]; then
+        printf '%s\n' "$rel"
+        return 0
+    fi
+
+    printf '%s\n' ""
+    return 1
+}
+
+uninstall_kernel_for_grub()
+{
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+    local rc
+
+    # Don’t remove the running kernel.
+    status_begin "   - Checking running kernel on target"
+    local CURRENT
+    CURRENT="$(ssh $SSH_OPTS "$TARGET_HOST" 'uname -r' 2>/dev/null || true)"
+    if [[ "$CURRENT" == "$KERNEL_RELEASE" ]]; then
+        status_end_fail "   - Checking running kernel on target" 65
+        echo "${BOLD}${RED}Error: refusing to uninstall running kernel: ${CYAN}${CURRENT}"
+        echo "${NORMAL}"
+
+        echo "${WHITE}First, boot into another kernel:"
+        echo "${CYAN}$ sudo grubby --info=ALL"
+        echo "${CYAN}$ sudo grubby --set-default /boot/Image-<version>"
+        echo "${CYAN}$ sudo grubby --default-kernel"
+        echo "${CYAN}$ sudo reboot"
+        echo "${CYAN}$ uname -r"
+        echo "${NORMAL}"
+        echo "${WHITE}... and then try again with the uninstall."
+        echo "${NORMAL}"
+
+        exit 65
+    else
+        status_end_ok "   - Checking running kernel on target"
+    fi
+
+    # Remove GRUB entry if present.
+    status_begin "   - Removing GRUB entry"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo grubby --info=/boot/Image-$KERNEL_RELEASE >/dev/null 2>&1"; then
+        if ssh $SSH_OPTS "$TARGET_HOST" "sudo grubby --remove-kernel /boot/Image-$KERNEL_RELEASE" 2>&1; then
+            status_end_ok "   - Removing GRUB entry"
+        else
+            rc=$?; status_end_fail "   - Removing GRUB entry" "$rc"; return "$rc"
+        fi
+    else
+        # No entry: still 'Done' (idempotent)
+        status_end_ok "   - Removing GRUB entry"
+    fi
+
+    # Remove images/initramfs.
+    status_begin "   - Removing /boot/Image-* and initramfs"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo rm -f '/boot/Image-$KERNEL_RELEASE' '/boot/initramfs-$KERNEL_RELEASE.img' || true" 2>&1; then
+        status_end_ok "   - Removing /boot/Image-* and initramfs"
+    else
+        rc=$?; status_end_fail "   - Removing /boot/Image-* and initramfs" "$rc"; return "$rc"
+    fi
+
+    # Remove DTBs.
+    status_begin "   - Removing DTBs for $KERNEL_RELEASE"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo rm -rf '/boot/dtb-$KERNEL_RELEASE' || true" 2>&1; then
+        status_end_ok "   - Removing DTBs for $KERNEL_RELEASE"
+    else
+        rc=$?; status_end_fail "   - Removing DTBs for $KERNEL_RELEASE" "$rc"; return "$rc"
+    fi
+
+    # Remove modules
+    status_begin "   - Removing /lib/modules/$KERNEL_RELEASE"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo rm -rf '/lib/modules/$KERNEL_RELEASE' || true" 2>&1; then
+        status_end_ok "   - Removing /lib/modules/$KERNEL_RELEASE"
+    else
+        rc=$?; status_end_fail "   - Removing /lib/modules/$KERNEL_RELEASE" "$rc"; return "$rc"
+    fi
+
+    echo ""
 }
 
 main()
@@ -481,6 +798,12 @@ main()
     validate_architecture
     validate_local_commands
     validate_install_mode "$INSTALL_MODE"
+
+    echo ""
+
+    if [[ "$DO_UNINSTALL" != true && "$DO_CLEAN" != true ]]; then
+        create_log_file
+    fi
 
     [[ "$DO_CLEAN" == true ]] && clean_kernel
 
@@ -502,24 +825,38 @@ main()
     fi
 
     if [[ "$DO_UNINSTALL" == true ]]; then
-        KERNEL_RELEASE="${KERNEL_RELEASE:-$(get_kernel_release)}"
-        uninstall_kernel
+        echo "${WHITE}Uninstalling on ${CYAN}${TARGET_HOST}${WHITE}...${NORMAL}:"
+        status_begin "   - Resolving target release to uninstall"
+        KERNEL_RELEASE="$(resolve_remote_kernel_release_for_uninstall || true)"
+        if [[ -n "$KERNEL_RELEASE" ]]; then
+            status_end_ok "   - Resolving target release to uninstall"
+        else
+            status_end_fail "   - Resolving target release to uninstall" 66
+            echo "${BOLD}${RED}Error: could not determine which kernel to uninstall on ${CYAN}${TARGET_HOST}"
+            echo "${NORMAL}"
+            exit 66
+        fi
+
+        uninstall_kernel_for_grub
         exit 0
     fi
 
     if $need_target && [[ -z "$KERNEL_RELEASE" ]]; then
         KERNEL_RELEASE="$(get_kernel_release)"
-        echo "Using existing build: $KERNEL_RELEASE"
+        echo "${WHITE}Using existing build: ${CYAN}${KERNEL_RELEASE}"
+        echo "${NORMAL}"
     fi
 
     if [[ -n "$INSTALL_MODE" ]]; then
         case "$INSTALL_MODE" in
-            boot)      install_boot_payloads ;;
-            grub)      install_grub ;;
-            extlinux)  install_extlinux ;;
-            rpm)       install_rpm ;;
+            boot)      install_kernel_to_boot_partition ;;
+            grub)      install_kernel_for_grub ;;
+            extlinux)  install_kernel_for_extlinux ;;
+            rpm)       install_kernel_with_rpm ;;
         esac
     fi
+
+    echo ""
 }
 
 main "$@"
