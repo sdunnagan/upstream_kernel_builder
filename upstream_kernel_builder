@@ -3,26 +3,8 @@
 #
 # File:         upstream_kernel_builder
 #
-# Description:
-# ------------
-# - Builds an upstream Linux kernel using an out-of-tree build dir and a
-#   known-good Fedora .config (copied in beforehand).
-#
-# - Optionally tweaks the .config for fast dev (-f) or debug (-d), then runs
-#   olddefconfig to normalize new symbols.
-#
-# - Installs to a remote target over SSH.
-#     * Modules: copied via tar-over-SSH to /lib/modules on the target.
-#     * Kernel image: copied to /boot.
-#     * DTB: copied to /boot.
-#     * Initramfs: created on the target using dracut.
-#
-# - Adds a GRUB boot entry on the target.
-#
-# - Supports multiple install modes:
-#     * grub: installation + GRUB entry
-#     * boot: installation only (no bootloader changes)
-#     * extlinux/rpm: TO DO.
+# Description:  Builds upstream Linux kernel and installs to a host running
+#               Fedora.  Tested with Fedora 41 running on RockPro64.
 #
 # Prerequisites:
 # --------------
@@ -40,16 +22,16 @@
 # Examples:
 # ---------
 # Build and install for GRUB on a specified target and fast initramfs:
-#     $ upstream_kernel_builder -s beethoven -t orthanc -a aarch64 -f -i grub -b
+#   $ upstream_kernel_builder -s sor -t orthanc -a aarch64 -f -i grub -b
 #
 # Install-only (reuse existing build; suffix is ignored without -b):
-#     $ upstream_kernel_builder -t orthanc -a aarch64 -f -i grub
+#   $ upstream_kernel_builder -t orthanc -a aarch64 -f -i grub
 #
-# Uninstall (remove the release containing -beethoven on target):
-#     $ upstream_kernel_builder -s beethoven -t orthanc -a aarch64 -u
+# Uninstall (remove the release containing -sor on target):
+#   $ upstream_kernel_builder -s sor -t orthanc -a aarch64 -u
 #
-# Clean the build (suffix not used here):
-#     $ upstream_kernel_builder -c
+# Clean the build:
+#   $ rm -rf $KERNEL_BUILD_DIR
 #------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -59,7 +41,6 @@ BUILD_ARCH="${BUILD_ARCH:-aarch64}"
 KERNEL_RELEASE=""
 INSTALL_MODE=""
 DO_BUILD=false
-DO_CLEAN=false
 DO_UNINSTALL=false
 DEBUG_CONFIG=false
 FAST_CONFIG=false
@@ -100,7 +81,6 @@ usage()
     echo "  -a <x86_64|aarch64|riscv64>   Architecture (default: aarch64)"
     echo "  -t <target_host>              Target host for deployment (required for install/uninstall)"
     echo "  -b                            Build the kernel (Image modules dtbs)"
-    echo "  -c                            Clean the kernel build (O= tree)"
     echo "  -d                            Configure kernel for debugging"
     echo "  -f                            Configure kernel for fast dev loop"
     echo "  -i <boot|grub|extlinux|rpm>   Installation mode (focus: grub)"
@@ -115,12 +95,11 @@ usage()
     exit 1
 }
 
-while getopts "a:t:bcdfhi:us:" opt; do
+while getopts "a:t:bdfhi:us:" opt; do
     case $opt in
         a) BUILD_ARCH="$OPTARG" ;;
         t) TARGET_HOST="$OPTARG" ;;
         b) DO_BUILD=true ;;
-        c) DO_CLEAN=true ;;
         d) DEBUG_CONFIG=true ;;
         f) FAST_CONFIG=true ;;
         i) INSTALL_MODE="$OPTARG" ;;
@@ -131,24 +110,28 @@ while getopts "a:t:bcdfhi:us:" opt; do
     esac
 done
 
-status_begin() {
+status_begin()
+{
   local msg="$1"
   printf "%s%s...%s" "${WHITE}" "$msg" "${NORMAL}"
 }
 
 # Clear current line, then print final text + newline.
-status_end_ok() {
+status_end_ok()
+{
   local msg="$1"
   printf "\r\033[2K%s%s... %sDone%s\n" "${WHITE}" "$msg" "${BOLD}${GREEN}" "${NORMAL}"
 }
 
-status_end_fail() {
+status_end_fail()
+{
   local msg="$1" rc="${2:-1}"
   printf "\r\033[2K%s%s... %sFailed%s (rc=%s)\n" "${WHITE}" "$msg" "${BOLD}${RED}" "${NORMAL}" "$rc"
 }
 
-# Normalize suffix: "beethoven" -> "-beethoven"; "-beethoven" stays; "none"/"" -> ""
-normalize_localversion() {
+# Normalize suffix: "sor" -> "-sor"; "-sor" stays; "none"/"" -> ""
+normalize_localversion()
+{
     local s="$1"
     if [[ -z "$s" || "$s" == "none" ]]; then
         echo ""
@@ -165,7 +148,8 @@ if [[ -n "$CLI_SUFFIX" ]]; then
     LOCALVERSION="$(normalize_localversion "$CLI_SUFFIX")"
 fi
 
-create_log_file() {
+create_log_file()
+{
     local ts gccv host
     ts="$(date +"%Y_%m_%d_%H%M")"
     gccv="$(gcc --version | head -n 1 || true)"
@@ -300,12 +284,6 @@ setup_cross_compile()
             riscv64) export CROSS_COMPILE=riscv64-linux-gnu- ;;
         esac
     fi
-}
-
-clean_kernel()
-{
-    echo "${WHITE}Cleaning O=$KERNEL_BUILD_DIR ...${NORMAL}"
-    make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" mrproper
 }
 
 configure_kernel_for_debug()
@@ -801,11 +779,9 @@ main()
 
     echo ""
 
-    if [[ "$DO_UNINSTALL" != true && "$DO_CLEAN" != true ]]; then
+    if [[ "$DO_UNINSTALL" != true ]]; then
         create_log_file
     fi
-
-    [[ "$DO_CLEAN" == true ]] && clean_kernel
 
     if [[ "$DO_BUILD" == true ]]; then
         configure_kernel
