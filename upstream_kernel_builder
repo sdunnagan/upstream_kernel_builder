@@ -13,7 +13,7 @@
 # - Clone mainline Linux into $KERNEL_SRC_DIR:
 #   $ git clone https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$KERNEL_SRC_DIR"
 #
-# - Copy a working kernel config from a target to serve as a starting point:
+# - Copy a kernel config from a target host to serve as a starting point:
 #   $ mkdir $KERNEL_BUILD_DIR
 #   $ ssh orthanc 'cat /boot/config-$(uname -r)' > "$KERNEL_BUILD_DIR/.config"
 #
@@ -21,14 +21,20 @@
 #
 # Examples:
 # ---------
-# Build and install for GRUB on a specified target and fast initramfs:
-#   $ upstream_kernel_builder -s sor -t orthanc -a aarch64 -f -i grub -b
+# Set an env variable with a kernel identifier:
+#   $ KERNEL_ID=guiliani
+#
+# Set an env variable with the remote hostname:
+#   $ TARGET_HOST=orthanc
+# 
+# Build and install for GRUB on a specified target host:
+#   $ ./upstream_kernel_builder -s $KERNEL_ID -t $TARGET_HOST -a aarch64 -f -i grub -b
 #
 # Install-only (reuse existing build; suffix is ignored without -b):
-#   $ upstream_kernel_builder -t orthanc -a aarch64 -f -i grub
+#   $ ./upstream_kernel_builder -s $KERNEL_ID -t $TARGET_HOST -a aarch64 -f -i grub
 #
-# Uninstall (remove the release containing -sor on target):
-#   $ upstream_kernel_builder -s sor -t orthanc -a aarch64 -u
+# Uninstall:
+#   $ ./upstream_kernel_builder -s $KERNEL_ID -t $TARGET_HOST -a aarch64 -u
 #
 # Clean the build:
 #   $ rm -rf $KERNEL_BUILD_DIR
@@ -110,6 +116,7 @@ while getopts "a:t:bdfhi:us:" opt; do
     esac
 done
 
+
 status_begin()
 {
   local msg="$1"
@@ -129,7 +136,6 @@ status_end_fail()
   printf "\r\033[2K%s%s... %sFailed%s (rc=%s)\n" "${WHITE}" "$msg" "${BOLD}${RED}" "${NORMAL}" "$rc"
 }
 
-# Normalize suffix: "sor" -> "-sor"; "-sor" stays; "none"/"" -> ""
 normalize_localversion()
 {
     local s="$1"
@@ -143,6 +149,18 @@ normalize_localversion()
         echo "-$s"
     fi
 }
+
+# Validate that a kernel identifier was provided (via -s or $KERNEL_ID)
+if [[ -z "${CLI_SUFFIX:-}" && -z "${KERNEL_ID:-}" ]]; then
+    echo "${BOLD}${RED}Error: Kernel ID (suffix) must be provided."
+    echo "${NORMAL}Use -s <suffix> or set KERNEL_ID in the environment."
+    exit 1
+fi
+
+# If -s wasn't given, fall back to environment variable
+if [[ -z "${CLI_SUFFIX:-}" && -n "${KERNEL_ID:-}" ]]; then
+    CLI_SUFFIX="$KERNEL_ID"
+fi
 
 if [[ -n "$CLI_SUFFIX" ]]; then
     LOCALVERSION="$(normalize_localversion "$CLI_SUFFIX")"
@@ -535,10 +553,15 @@ install_kernel_to_boot_partition()
     else rc=$?; status_end_fail "     - Cleaning staging dir" "$rc"; return "$rc"; fi
 
     # Build modules in the O= tree
-    status_begin "   - Building modules"
-    if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules >>"$LOG_FILE" 2>&1; then
-        status_end_ok "   - Building modules"
-    else rc=$?; status_end_fail "   - Building modules" "$rc"; return "$rc"; fi
+    if [[ ! -d "$KERNEL_BUILD_DIR/modules" && ! $(find "$KERNEL_BUILD_DIR" -name '*.ko' 2>/dev/null) ]]; then
+        status_begin "   - Building modules (first-time)"
+        if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules >>"$LOG_FILE" 2>&1; then
+            status_end_ok "   - Building modules (first-time)"
+        else rc=$?; status_end_fail "   - Building modules" "$rc"; return "$rc"; fi
+    else
+        status_begin "   - Skipping module rebuild (already built)"
+        status_end_ok "   - Skipping module rebuild (already built)"
+    fi
 
     # Install modules into the stage dir
     status_begin "   - Staging modules"
