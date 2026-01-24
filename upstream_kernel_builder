@@ -55,6 +55,12 @@ LOCALVERSION="${LOCALVERSION:-}"
 LOG_DIR="${LOG_DIR:-$HOME/logs}"
 LOG_FILE=""
 
+# DTB selection (override if needed)
+DTS_VENDOR="${DTS_VENDOR:-rockchip}"
+DTB_NAME="${DTB_NAME:-rk3588-orangepi-5-plus.dtb}"
+DTB_BOOT_PATH="/boot/dtb/${DTS_VENDOR}/${DTB_NAME}"
+DTB_BUILD_PATH="${KERNEL_BUILD_DIR}/arch/arm64/boot/dts/${DTS_VENDOR}/${DTB_NAME}"
+
 BLACK=$(tput setaf 0)
 RED=$(tput setaf 1)
 GREEN=$(tput setaf 2)
@@ -282,11 +288,13 @@ ensure_remote_sudo()
 
 validate_remote_commands()
 {
-    # Check required tools on the target as root.
     ssh "${TARGET_HOST}" 'set -e
         miss=0
-        for c in grubby dracut tar tee install chmod mkdir depmod; do
-            sudo -n sh -lc "command -v $c >/dev/null 2>&1" || { echo "Missing on target (as root): $c"; miss=1; }
+        for c in grubby dracut tar tee install chmod mkdir depmod dtc fdtoverlay; do
+            sudo -n sh -lc "command -v $c >/dev/null 2>&1" || {
+                echo "Missing on target (as root): $c"
+                miss=1
+            }
         done
         exit $miss
     '
@@ -435,6 +443,48 @@ set_config_with_localversion()
     make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules_prepare >/dev/null
 }
 
+build_symbol_dtb()
+{
+    local rc
+    local label="   - Building DTB with symbols (-@): ${DTB_NAME}"
+
+    rm -f "$DTB_BUILD_PATH"
+
+    status_begin "$label"
+    if make -C "$KERNEL_SRC_DIR" -j"$(nproc)" O="$KERNEL_BUILD_DIR" ARCH=arm64 \
+        V=1 "${DTS_VENDOR}/${DTB_NAME}" DTC_FLAGS="-@" >>"$LOG_FILE" 2>&1; then
+        status_end_ok "$label"
+    else
+        rc=$?
+        status_end_fail "$label" "$rc"
+        return "$rc"
+    fi
+
+    # Check that the built DTB contains symbols.
+    status_begin "   - Verifying built DTB contains /__symbols__"
+    if command -v fdtget >/dev/null 2>&1; then
+        if fdtget -l "$DTB_BUILD_PATH" /__symbols__ >/dev/null 2>&1; then
+            status_end_ok "   - Verifying built DTB contains /__symbols__"
+        else
+            rc=$?
+            status_end_fail "   - Verifying built DTB contains /__symbols__" "$rc"
+            echo "ERROR: Built DTB is missing /__symbols__: $DTB_BUILD_PATH" >&2
+            return 1
+        fi
+    else
+        # Fallback: dtc decompile must also use -@
+        if "$KERNEL_SRC_DIR/scripts/dtc/dtc" -@ -I dtb -O dts -o - "$DTB_BUILD_PATH" \
+            | grep -q '^/__symbols__'; then
+            status_end_ok "   - Verifying built DTB contains /__symbols__"
+        else
+            rc=$?
+            status_end_fail "   - Verifying built DTB contains /__symbols__" "$rc"
+            echo "ERROR: Built DTB is missing /__symbols__: $DTB_BUILD_PATH" >&2
+            return 1
+        fi
+    fi
+}
+
 build_kernel()
 {
     local rc
@@ -509,6 +559,11 @@ build_kernel()
         return "$rc"
     fi
 
+    # Build DTBs with symbols.
+    if ! build_symbol_dtb; then
+        return $?
+    fi
+
     status_begin "   - Determining kernel release"
     KERNEL_RELEASE="$(get_kernel_release)"
     if [[ -n "$KERNEL_RELEASE" ]]; then
@@ -542,8 +597,10 @@ create_and_install_initramfs()
 
 install_kernel_to_boot_partition()
 {
-    # optional: make SSH snappier on failures
     local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+    local rc
+
+    [[ -n "${KERNEL_RELEASE:-}" ]] || KERNEL_RELEASE="$(get_kernel_release)"
 
     # Prepare staging dir
     local STAGE="$KERNEL_BUILD_DIR/stage"
@@ -553,7 +610,7 @@ install_kernel_to_boot_partition()
     else rc=$?; status_end_fail "     - Cleaning staging dir" "$rc"; return "$rc"; fi
 
     # Build modules in the O= tree
-    if [[ ! -d "$KERNEL_BUILD_DIR/modules" && ! $(find "$KERNEL_BUILD_DIR" -name '*.ko' 2>/dev/null) ]]; then
+    if ! find "$KERNEL_BUILD_DIR" -name '*.ko' -print -quit 2>/dev/null | grep -q .; then
         status_begin "   - Building modules (first-time)"
         if make -C "$KERNEL_SRC_DIR" O="$KERNEL_BUILD_DIR" ARCH=arm64 modules >>"$LOG_FILE" 2>&1; then
             status_end_ok "   - Building modules (first-time)"
@@ -570,7 +627,7 @@ install_kernel_to_boot_partition()
         status_end_ok "   - Staging modules"
     else rc=$?; status_end_fail "   - Staging modules" "$rc"; return "$rc"; fi
 
-    # Copy module tree → target:/lib/modules/<rel>
+    # Copy modules to /lib/modules.
     status_begin "   - Copying modules"
     if tar -C "$STAGE/lib/modules" -cf - "$KERNEL_RELEASE" \
          | ssh $SSH_OPTS "$TARGET_HOST" "sudo tar -C /lib/modules -xpf -"; then
@@ -583,7 +640,7 @@ install_kernel_to_boot_partition()
         status_end_ok "   - Running depmod on target"
     else rc=$?; status_end_fail "   - Running depmod on target" "$rc"; return "$rc"; fi
 
-    # Copy Image → /boot (use install to set perms and create if missing)
+    # Copy Image to /boot.
     status_begin "   - Copying kernel image"
     if ssh $SSH_OPTS "$TARGET_HOST" \
          "sudo install -m 0644 /dev/stdin '/boot/Image-$KERNEL_RELEASE' && \
@@ -592,15 +649,39 @@ install_kernel_to_boot_partition()
         status_end_ok "   - Copying kernel image"
     else rc=$?; status_end_fail "   - Copying kernel image" "$rc"; return "$rc"; fi
 
-    # Copy DTB
-    status_begin "   - Copying DTB"
+    status_begin "   - Backing up existing DTB"
+    if ssh $SSH_OPTS "$TARGET_HOST" "sudo sh -c '
+        set -e
+        if [ -f \"${DTB_BOOT_PATH}\" ]; then
+            cp -a \"${DTB_BOOT_PATH}\" \"${DTB_BOOT_PATH}.pre-${KERNEL_RELEASE}\"
+        fi
+    ' " >>"$LOG_FILE" 2>&1; then
+        status_end_ok "   - Backing up existing DTB"
+    else
+        rc=$?
+        status_end_fail "   - Backing up existing DTB" "$rc"
+    fi
+
+    # Copy DTB built with symbols to the path GRUB 'devicetree' uses.
+    status_begin "   - Copying DTB (${DTB_NAME}) to ${DTB_BOOT_PATH}"
     if ssh $SSH_OPTS "$TARGET_HOST" \
-         "sudo install -D -m 0644 /dev/stdin \
-            '/boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb' && \
-          (command -v restorecon >/dev/null 2>&1 && sudo restorecon -F '/boot/dtb-$KERNEL_RELEASE/rockchip/rk3399-rockpro64.dtb' || true)" \
-       < "$KERNEL_BUILD_DIR/arch/arm64/boot/dts/rockchip/rk3399-rockpro64.dtb"; then
-        status_end_ok "   - Copying DTB"
-    else rc=$?; status_end_fail "   - Copying DTB" "$rc"; return "$rc"; fi
+         "sudo install -D -m 0644 /dev/stdin '${DTB_BOOT_PATH}' && \
+          (command -v restorecon >/dev/null 2>&1 && sudo restorecon -F '${DTB_BOOT_PATH}' || true)" \
+       < "$DTB_BUILD_PATH"; then
+        status_end_ok "   - Copying DTB (${DTB_NAME}) to ${DTB_BOOT_PATH}"
+    else
+        rc=$?; status_end_fail "   - Copying DTB (${DTB_NAME}) to ${DTB_BOOT_PATH}" "$rc"; return "$rc"
+    fi
+
+    status_begin "   - Verifying DTB contains /__symbols__"
+    if ssh $SSH_OPTS "$TARGET_HOST" \
+         "sudo dtc -I dtb -O dts -o - '${DTB_BOOT_PATH}' 2>/dev/null | grep -q '__symbols__'"; then
+        status_end_ok "   - Verifying DTB contains /__symbols__"
+    else
+        rc=$?; status_end_fail "   - Verifying DTB contains /__symbols__" "$rc"
+        echo "ERROR: Installed DTB is missing /__symbols__. Overlay application will fail." >&2
+        return 1
+    fi
 
     # Create initramfs on the target and install it.
     if ! create_and_install_initramfs; then
@@ -775,13 +856,17 @@ uninstall_kernel_for_grub()
         rc=$?; status_end_fail "   - Removing /boot/Image-* and initramfs" "$rc"; return "$rc"
     fi
 
-    # Remove DTBs.
-    status_begin "   - Removing DTBs for $KERNEL_RELEASE"
-    if ssh $SSH_OPTS "$TARGET_HOST" "sudo rm -rf '/boot/dtb-$KERNEL_RELEASE' || true" 2>&1; then
-        status_end_ok "   - Removing DTBs for $KERNEL_RELEASE"
-    else
-        rc=$?; status_end_fail "   - Removing DTBs for $KERNEL_RELEASE" "$rc"; return "$rc"
-    fi
+    # Restore prior DTB.
+    status_begin "   - Restoring DTB backup (if present)"
+    ssh $SSH_OPTS "$TARGET_HOST" "sudo sh -c '
+        set -e
+        b=\"${DTB_BOOT_PATH}.pre-${KERNEL_RELEASE}\"
+        if [ -f \"\$b\" ]; then
+            cp -a \"\$b\" \"${DTB_BOOT_PATH}\"
+            (command -v restorecon >/dev/null 2>&1 && restorecon -F \"${DTB_BOOT_PATH}\" || true)
+        fi
+    '" >>"$LOG_FILE" 2>&1 || true
+    status_end_ok "   - Restoring DTB backup (if present)"
 
     # Remove modules
     status_begin "   - Removing /lib/modules/$KERNEL_RELEASE"
